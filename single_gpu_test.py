@@ -1,0 +1,155 @@
+import os
+import time
+import argparse
+import torch
+import torch.nn as nn
+from torchvision import transforms, datasets
+import fused_resnet
+import matplotlib.pyplot as plt
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--device",    type=str, default="0")
+    parser.add_argument("--data_root", type=str, default="../data")
+    parser.add_argument("--dataset",   type=str, default="MNIST", help="MNIST, CIFAR-10, N-MNIST, DvsGesture")
+    parser.add_argument("--neuron",    type=str, default="LIF",   help="LIF, TernaryLIF")
+    parser.add_argument("--arch",      type=str, default="Spiking-ResNet18", help="Spiking-ResNet18, Spiking-ResNet34, Spiking-ResNet50")
+    parser.add_argument("--timing",    action="store_true", default=True)
+    return parser.parse_args()
+
+if __name__ == "__main__":
+    args = parse_args()
+    os.environ["CUDA_VISIBLE_DEVICES"] = args.device
+    device = "cuda:0"
+    T  = 32
+    E  = 5
+    lr = 1e-3
+
+    if args.dataset == "MNIST":
+        C = 10
+        B = 100
+        trainset = datasets.MNIST(root=args.data_root, train=True,  download=True, transform=transforms.ToTensor())
+        testset  = datasets.MNIST(root=args.data_root, train=False, download=True, transform=transforms.ToTensor())
+        trainloader = torch.utils.data.DataLoader(trainset, batch_size=B, shuffle=True)
+        testloader  = torch.utils.data.DataLoader(testset,  batch_size=B, shuffle=False)
+        is_dvs = False
+    elif args.dataset == "CIFAR-10":
+        C = 10
+        B = 100
+        trainset = datasets.CIFAR10(root=args.data_root, train=True,  download=True, transform=transforms.ToTensor())
+        testset  = datasets.CIFAR10(root=args.data_root, train=False, download=True, transform=transforms.ToTensor())
+        trainloader = torch.utils.data.DataLoader(trainset, batch_size=B, shuffle=True)
+        testloader  = torch.utils.data.DataLoader(testset,  batch_size=B, shuffle=False)
+        is_dvs = False
+    elif args.dataset == "N-MNIST":
+        from spikingjelly.datasets.n_mnist import NMNIST
+        C = 10
+        B = 100
+        trainset = NMNIST(root=os.path.join(args.data_root, "NMNIST"), train=True,  data_type="frame", frames_number=T, split_by="number")
+        testset  = NMNIST(root=os.path.join(args.data_root, "NMNIST"), train=False, data_type="frame", frames_number=T, split_by="number")
+        trainloader = torch.utils.data.DataLoader(trainset, batch_size=B, shuffle=True)
+        testloader  = torch.utils.data.DataLoader(testset,  batch_size=B, shuffle=False)
+        is_dvs = True
+    elif args.dataset == "DvsGesture":
+        from spikingjelly.datasets.dvs128_gesture import DVS128Gesture
+        C = 11
+        B = 10
+        trainset = DVS128Gesture(root=os.path.join(args.data_root, "DvsGesture"), train=True,  data_type="frame", frames_number=T, split_by="number")
+        testset  = DVS128Gesture(root=os.path.join(args.data_root, "DvsGesture"), train=False, data_type="frame", frames_number=T, split_by="number")
+        trainloader = torch.utils.data.DataLoader(trainset, batch_size=B, shuffle=True)
+        testloader  = torch.utils.data.DataLoader(testset,  batch_size=B, shuffle=False)
+        is_dvs = True
+    else:
+        raise NotImplementedError("Not supported dataset.")
+
+    if args.neuron == "LIF":
+        from neuron import LIF
+        spiking_neuron = LIF(decay=0.2, threshold=0.3, time_step=T)
+    elif args.neuron == "TernaryLIF":
+        from neuron import TernaryLIF
+        spiking_neuron = TernaryLIF(decay=0.2, threshold=0.3, time_step=T)
+    else:
+        raise NotImplementedError("Not supported spiking neuron.")
+
+    if args.arch == "Spiking-ResNet18":
+        model = fused_resnet.spiking_resnet18(spiking_neuron=spiking_neuron, time_step=T, num_classes=C).to(device)
+    elif args.arch == "Spiking-ResNet34":
+        model = fused_resnet.spiking_resnet34(spiking_neuron=spiking_neuron, time_step=T, num_classes=C).to(device)
+    elif args.arch == "Spiking-ResNet50":
+        model = fused_resnet.spiking_resnet50(spiking_neuron=spiking_neuron, time_step=T, num_classes=C).to(device)
+    else:
+        raise RuntimeError("Not supported neural architecture.")
+
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+
+    print(model)
+    print(f"selected dataset:      {args.dataset}")
+    print(f"selected neuron:       {args.neuron}")
+    print(f"selected architecture: {args.arch}")
+
+    train_losses    = []
+    test_accuracies = []
+
+    for epoch in range(E):
+        running_loss = 0.0
+        model.train()
+        t0 = time.time()
+        for index, (images, labels) in enumerate(trainloader, 1):
+            optimizer.zero_grad()
+            if is_dvs:
+                images = images.permute(1, 0, 2, 3, 4)
+                images = torch.cat([images, torch.zeros_like(images[:, :, :1])], dim=2).to(device)
+            else:
+                if images.shape[1] == 1:
+                    images = images.repeat(1, 3, 1, 1)
+                images = torch.stack([(images > torch.rand(images.shape)).float() for _ in range(T)]).to(device)
+            labels = labels.to(device)
+            logits = model(images)
+            loss   = criterion(logits, labels)
+            loss.backward()
+            running_loss += loss.item()
+            optimizer.step()
+            if not args.timing and index % 100 == 0:
+                print("[%d, %5d] loss: %.5f" % (epoch + 1, index, running_loss))
+        torch.cuda.synchronize()
+        print(f"Epoch {epoch}, Training time elapsed: {time.time() - t0}")
+        train_losses.append(running_loss / len(trainloader))
+
+        correct = 0
+        total   = 0
+        model.eval()
+        with torch.no_grad():
+            t1 = time.time()
+            for (images, labels) in testloader:
+                if is_dvs:
+                    images = images.permute(1, 0, 2, 3, 4)
+                    images = torch.cat([images, torch.zeros_like(images[:, :, :1])], dim=2).to(device)
+                else:
+                    if images.shape[1] == 1:
+                        images = images.repeat(1, 3, 1, 1)
+                    images = torch.stack([(images > torch.rand(images.shape)).float() for _ in range(T)]).to(device)
+                labels = labels.to(device)
+                logits = model(images)
+                _, predicted = torch.max(logits, 1)
+                total   += labels.size(0)
+                correct += (predicted == labels).sum().item()
+            torch.cuda.synchronize()
+            print(f"Epoch {epoch}, Testing time elapsed:  {time.time() - t1}")
+        acc = 100 * correct / total
+        test_accuracies.append(acc)
+        print("Epoch %d, Accuracy: %.6f %%" % (epoch, acc))
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
+    ax1.plot(range(E), train_losses, marker='o')
+    ax1.set_title("Training Loss")
+    ax1.set_xlabel("Epoch")
+    ax1.set_ylabel("Loss")
+    ax2.plot(range(E), test_accuracies, marker='o', color='orange')
+    ax2.set_title("Test Accuracy")
+    ax2.set_xlabel("Epoch")
+    ax2.set_ylabel("Accuracy (%)")
+    plt.suptitle(f"{args.arch} | {args.neuron} | {args.dataset}")
+    plt.tight_layout()
+    plt.savefig("results.png")
+    print("Plot saved to results.png")
